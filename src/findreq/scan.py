@@ -109,7 +109,8 @@ class FindPackage:
         site_packages_paths = [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p]
 
         if origin:
-            if origin.startswith(stdlib_path):
+            # include lib-dynload for Linux built-in modules
+            if origin.startswith(stdlib_path) or "lib-dynload" in origin:
                 return "built_in"
             elif origin.startswith(self.project_dir):
                 return "local"
