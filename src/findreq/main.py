@@ -1,97 +1,159 @@
 import os
 import ast
 import sys
+import importlib.util
+import sysconfig
+import json
+from importlib import metadata
+import requests
 
-STANDARD_MODULES = {
-    'abc', 'argparse', 'array', 'ast', 'asyncio', 'base64', 'binascii', 'bisect',
-    'calendar', 'cmath', 'collections', 'concurrent', 'contextlib', 'copy', 'csv',
-    'ctypes', 'datetime', 'decimal', 'difflib', 'email', 'enum', 'errno', 'faulthandler',
-    'fnmatch', 'functools', 'gc', 'getopt', 'getpass', 'glob', 'gzip', 'hashlib',
-    'heapq', 'hmac', 'html', 'http', 'imaplib', 'importlib', 'inspect', 'io', 'itertools',
-    'json', 'keyword', 'linecache', 'locale', 'logging', 'lzma', 'math', 'mimetypes',
-    'multiprocessing', 'numbers', 'operator', 'os', 'pathlib', 'pickle', 'platform',
-    'plistlib', 'queue', 'random', 're', 'sched', 'select', 'selectors', 'shlex',
-    'shutil', 'signal', 'site', 'socket', 'sqlite3', 'ssl', 'statistics', 'string',
-    'struct', 'subprocess', 'sys', 'tempfile', 'textwrap', 'threading', 'time',
-    'timeit', 'tkinter', 'traceback', 'types', 'typing', 'unittest', 'urllib', 'uuid',
-    'warnings', 'weakref', 'xml', 'xmlrpc', 'zipfile', 'zoneinfo'
-}
+CACHE_FILE = ".pypi_cache.json"
 
-PACKAGE_MAP = {
-    "dotenv": "python-dotenv",
-    "mysql": "mysql-connector-python",
-    "bs4": "beautifulsoup4",
-    "cv2": "opencv-python",
-    "pil": "pillow",
-    "yaml": "pyyaml",
-    "sklearn": "scikit-learn",
-    "PIL": "pillow",
-}
+class FindPackage:
+    """Main scanner class"""
 
-def find_imports_in_file(file_path):
-    imports = set()
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            tree = ast.parse(f.read(), filename=file_path)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.add(alias.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
+    def __init__(self, project_dir="."):
+        self.project_dir = project_dir
+        self._cache = self._load_cache()
+        self._built_in, self._local, self._third_party = self._analyze_project()
+
+    # --- Properties ---
+    @property
+    def built_in(self):
+        return self._built_in
+
+    @property
+    def local(self):
+        return self._local
+
+    @property
+    def third_party(self):
+        return self._third_party
+
+    # --- Methods ---
+    def print_summary(self):
+        print("\n🧩 Built-in modules:")
+        for mod in sorted(self._built_in):
+            print(f"- {mod}")
+
+        print("\n📁 Local modules:")
+        for mod in sorted(self._local):
+            print(f"- {mod}")
+
+        print("\n📦 Third-party packages:")
+        for mod in sorted(self._third_party):
+            print(f"- {mod}")
+
+        cmd = self.install_command()
+        if cmd:
+            print("\n💡 Suggested installation command:")
+            print(cmd)
+
+    def install_command(self):
+        if not self._third_party:
+            return ""
+        return "pip install " + " ".join(sorted(self._third_party))
+
+    # --- Internal ---
+    def _load_cache(self):
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_cache(self):
+        try:
+            with open(CACHE_FILE, "w") as f:
+                json.dump(self._cache, f, indent=2)
+        except Exception:
+            pass
+
+    def _analyze_project(self):
+        all_imports = set()
+        for root, _, files in os.walk(self.project_dir):
+            if any(skip in root for skip in ["venv", ".venv", "__pycache__", "node_modules"]):
+                continue
+            for file in files:
+                if file.endswith(".py"):
+                    all_imports.update(self._find_imports_in_file(os.path.join(root, file)))
+
+        built_in, local, third_party = set(), set(), set()
+        for mod in all_imports:
+            if self._is_local_module(mod):
+                local.add(mod)
+            elif self._is_builtin_or_stdlib(mod):
+                built_in.add(mod)
+            else:
+                third_party.add(self._lookup_package(mod))
+
+        self._save_cache()
+        return built_in, local, third_party
+
+    def _find_imports_in_file(self, file_path):
+        imports = set()
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=file_path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.add(alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
                     imports.add(node.module.split(".")[0])
-    except Exception:
-        pass
-    return imports
+        except Exception:
+            pass
+        return imports
 
-def is_local_module(module_name, project_dir):
-    for root, dirs, files in os.walk(project_dir):
-        if module_name + ".py" in files or module_name in dirs:
-            return True
-    return False
+    def _is_local_module(self, mod):
+        for root, dirs, files in os.walk(self.project_dir):
+            if mod + ".py" in files or mod in dirs:
+                return True
+        return False
 
-def analyze_project(project_dir):
-    all_imports = set()
-    for root, _, files in os.walk(project_dir):
-        for file in files:
-            if file.endswith(".py"):
-                all_imports.update(find_imports_in_file(os.path.join(root, file)))
+    def _is_builtin_or_stdlib(self, mod):
+        try:
+            if mod in sys.builtin_module_names:
+                return True
+            spec = importlib.util.find_spec(mod)
+            if not spec or not spec.origin:
+                return False
+            if spec.origin in ("built-in", None):
+                return True
+            stdlib_path = sysconfig.get_path("stdlib")
+            return os.path.commonpath([os.path.realpath(spec.origin), stdlib_path]) == stdlib_path
+        except Exception:
+            return False
 
-    built_in, local, external = set(), set(), set()
+    def _lookup_package(self, mod):
+        if mod in self._cache:
+            return self._cache[mod]
 
-    for mod in all_imports:
-        if mod in sys.builtin_module_names or mod in STANDARD_MODULES:
-            built_in.add(mod)
-        elif is_local_module(mod, project_dir):
-            local.add(mod)
-        else:
-            external.add(mod)
+        # Local installed packages
+        try:
+            for dist, modules in metadata.packages_distributions().items():
+                if mod in modules:
+                    self._cache[mod] = dist
+                    return dist
+        except Exception:
+            pass
 
-    return built_in, local, external
+        # PyPI fallback
+        for name in {mod, mod.lower(), mod.replace("_", "-"), mod.lower().replace("_", "-")}:
+            try:
+                r = requests.get(f"https://pypi.org/pypi/{name}/json", timeout=2)
+                if r.status_code == 200:
+                    self._cache[mod] = name
+                    return name
+            except Exception:
+                pass
 
-def main():
-    PROJECT_DIR = "./"
-    built_in, local, external = analyze_project(PROJECT_DIR)
+        self._cache[mod] = mod
+        return mod
 
-    print("Built-in modules used:")
-    for mod in sorted(built_in):
-        print(f"- {mod}")
 
-    print("\nLocal project modules used:")
-    for mod in sorted(local):
-        print(f"- {mod}")
-
-    print("\nExternal packages (need to be installed via pip):")
-    for mod in sorted(external):
-        mapped = PACKAGE_MAP.get(mod, mod)
-        print(f"- {mod}  (install: {mapped})")
-
-    if external:
-        install_names = [PACKAGE_MAP.get(m, m) for m in sorted(external)]
-        print("\n💡 Suggested installation command:")
-        print("pip install " + " ".join(install_names))
-    else:
-        print("\n✅ No external packages found.")
-
-if __name__ == "__main__":
-    main()
+# --- Factory function ---
+def scan(project_dir="."):
+    return FindPackage(project_dir)
