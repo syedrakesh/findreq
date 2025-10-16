@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "findreq"
-version = "0.1.6"
+version = "0.1.7"
 description = "A Python utility to detect imported modules and generate pip install commands for a project."
 readme = "README.md"
 license = { text = "MIT" }

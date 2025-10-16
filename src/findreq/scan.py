@@ -108,14 +108,25 @@ class FindPackage:
         stdlib_path = sysconfig.get_path("stdlib")
         site_packages_paths = [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p]
 
-        if origin:
-            # include lib-dynload for Linux built-in modules
-            if origin.startswith(stdlib_path) or "lib-dynload" in origin:
-                return "built_in"
-            elif origin.startswith(self.project_dir):
-                return "local"
-            elif any(origin.startswith(p) for p in site_packages_paths):
-                return "third_party"
+        # Third-party if origin is in site-packages
+        if origin and any(origin.startswith(p) for p in site_packages_paths):
+            return "third_party"
+
+        # Built-in if origin in stdlib
+        if origin and origin.startswith(stdlib_path):
+            return "built_in"
+
+        # Local if inside project folder
+        if origin and origin.startswith(self.project_dir):
+            # Check if same module also exists in site-packages
+            for p in site_packages_paths:
+                try:
+                    dist_spec = importlib.util.find_spec(mod)
+                    if dist_spec and dist_spec.origin and dist_spec.origin.startswith(p):
+                        return "third_party"
+                except Exception:
+                    continue
+            return "local"
 
         # fallback: unknown origin → local
         return "local"
