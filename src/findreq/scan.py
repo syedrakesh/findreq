@@ -3,18 +3,15 @@ import ast
 import sys
 import importlib.util
 import sysconfig
-import json
 from importlib import metadata
 import requests
 
-CACHE_FILE = ".pypi_cache.json"
 
 class FindPackage:
-    """Main scanner class"""
+    """Main scanner class without cache"""
 
     def __init__(self, project_dir="."):
         self.project_dir = project_dir
-        self._cache = self._load_cache()
         self._built_in, self._local, self._third_party = self._analyze_project()
 
     # --- Properties ---
@@ -52,25 +49,9 @@ class FindPackage:
     def install_command(self):
         if not self._third_party:
             return ""
-        return "pip install " + " ".join(sorted(self._third_party))
+        return "pip install " + " ".join(sorted(set(self._third_party)))
 
     # --- Internal ---
-    def _load_cache(self):
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE) as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
-
-    def _save_cache(self):
-        try:
-            with open(CACHE_FILE, "w") as f:
-                json.dump(self._cache, f, indent=2)
-        except Exception:
-            pass
-
     def _analyze_project(self):
         all_imports = set()
         for root, _, files in os.walk(self.project_dir):
@@ -81,15 +62,16 @@ class FindPackage:
                     all_imports.update(self._find_imports_in_file(os.path.join(root, file)))
 
         built_in, local, third_party = set(), set(), set()
+
         for mod in all_imports:
-            if self._is_local_module(mod):
-                local.add(mod)
-            elif self._is_builtin_or_stdlib(mod):
+            # Check built-in / stdlib first
+            if self._is_builtin_or_stdlib(mod):
                 built_in.add(mod)
+            elif self._is_local_module(mod):
+                local.add(mod)
             else:
                 third_party.add(self._lookup_package(mod))
 
-        self._save_cache()
         return built_in, local, third_party
 
     def _find_imports_in_file(self, file_path):
@@ -128,14 +110,10 @@ class FindPackage:
             return False
 
     def _lookup_package(self, mod):
-        if mod in self._cache:
-            return self._cache[mod]
-
-        # Local installed packages
+        # Try local installed packages
         try:
             for dist, modules in metadata.packages_distributions().items():
                 if mod in modules:
-                    self._cache[mod] = dist
                     return dist
         except Exception:
             pass
@@ -145,15 +123,19 @@ class FindPackage:
             try:
                 r = requests.get(f"https://pypi.org/pypi/{name}/json", timeout=2)
                 if r.status_code == 200:
-                    self._cache[mod] = name
                     return name
             except Exception:
                 pass
 
-        self._cache[mod] = mod
         return mod
 
 
 # --- Factory function ---
 def scan(project_dir="."):
     return FindPackage(project_dir)
+
+
+# --- Example usage ---
+if __name__ == "__main__":
+    fp = scan(".")
+    fp.print_summary()
