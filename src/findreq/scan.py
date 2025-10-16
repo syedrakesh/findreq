@@ -4,17 +4,18 @@ import sys
 import importlib.util
 import sysconfig
 from importlib import metadata
-import requests
+
+PROJECT_DIR = "."  # Your project folder
 
 
 class FindPackage:
-    """Main scanner class without cache"""
+    """Dependency scanner with accurate built-in, local, and third-party detection"""
 
-    def __init__(self, project_dir="."):
-        self.project_dir = project_dir
+    def __init__(self, project_dir=PROJECT_DIR):
+        self.project_dir = os.path.abspath(project_dir)
+        self._script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
         self._built_in, self._local, self._third_party = self._analyze_project()
 
-    # --- Properties ---
     @property
     def built_in(self):
         return self._built_in
@@ -27,7 +28,6 @@ class FindPackage:
     def third_party(self):
         return self._third_party
 
-    # --- Methods ---
     def print_summary(self):
         print("\n🧩 Built-in modules:")
         for mod in sorted(self._built_in):
@@ -38,20 +38,16 @@ class FindPackage:
             print(f"- {mod}")
 
         print("\n📦 Third-party packages:")
-        for mod in sorted(self._third_party):
-            print(f"- {mod}")
+        for mod in sorted(self._third_party.keys()):
+            print(f"- {mod}  (install: {self._third_party[mod]})")
 
-        cmd = self.install_command()
-        if cmd:
+        if self._third_party:
             print("\n💡 Suggested installation command:")
+            cmd = "pip install " + " ".join(sorted(set(self._third_party.values())))
             print(cmd)
 
-    def install_command(self):
-        if not self._third_party:
-            return ""
-        return "pip install " + " ".join(sorted(set(self._third_party)))
+    # ----------------- Internal -----------------
 
-    # --- Internal ---
     def _analyze_project(self):
         all_imports = set()
         for root, _, files in os.walk(self.project_dir):
@@ -61,16 +57,20 @@ class FindPackage:
                 if file.endswith(".py"):
                     all_imports.update(self._find_imports_in_file(os.path.join(root, file)))
 
-        built_in, local, third_party = set(), set(), set()
+        built_in, local, third_party = set(), set(), {}
 
         for mod in all_imports:
-            # Check built-in / stdlib first
-            if self._is_builtin_or_stdlib(mod):
+            if mod == self._script_name:
+                continue
+
+            classification = self._classify_module(mod)
+
+            if classification == "built_in":
                 built_in.add(mod)
-            elif self._is_local_module(mod):
+            elif classification == "local":
                 local.add(mod)
-            else:
-                third_party.add(self._lookup_package(mod))
+            elif classification == "third_party":
+                third_party[mod] = self._get_distribution_name(mod)
 
         return built_in, local, third_party
 
@@ -89,53 +89,62 @@ class FindPackage:
             pass
         return imports
 
-    def _is_local_module(self, mod):
-        for root, dirs, files in os.walk(self.project_dir):
-            if mod + ".py" in files or mod in dirs:
-                return True
-        return False
-
-    def _is_builtin_or_stdlib(self, mod):
+    def _get_module_origin(self, mod):
+        """Return absolute path where module is loaded from, or None"""
         try:
-            if mod in sys.builtin_module_names:
-                return True
             spec = importlib.util.find_spec(mod)
-            if not spec or not spec.origin:
-                return False
-            if spec.origin in ("built-in", None):
-                return True
-            stdlib_path = sysconfig.get_path("stdlib")
-            return os.path.commonpath([os.path.realpath(spec.origin), stdlib_path]) == stdlib_path
-        except Exception:
-            return False
-
-    def _lookup_package(self, mod):
-        # Try local installed packages
-        try:
-            for dist, modules in metadata.packages_distributions().items():
-                if mod in modules:
-                    return dist
+            if spec and spec.origin:
+                return os.path.abspath(spec.origin)
         except Exception:
             pass
+        return None
 
-        # PyPI fallback
-        for name in {mod, mod.lower(), mod.replace("_", "-"), mod.lower().replace("_", "-")}:
-            try:
-                r = requests.get(f"https://pypi.org/pypi/{name}/json", timeout=2)
-                if r.status_code == 200:
-                    return name
-            except Exception:
-                pass
+    def _classify_module(self, mod):
+        """Classify module as built_in, local, or third_party"""
+        if mod in sys.builtin_module_names:
+            return "built_in"
 
+        origin = self._get_module_origin(mod)
+        stdlib_path = sysconfig.get_path("stdlib")
+        site_packages_paths = [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p]
+
+        if origin:
+            if origin.startswith(stdlib_path):
+                return "built_in"
+            elif origin.startswith(self.project_dir):
+                return "local"
+            elif any(origin.startswith(p) for p in site_packages_paths):
+                return "third_party"
+
+        # fallback: unknown origin → local
+        return "local"
+
+    def _is_local_module(self, mod):
+        return os.path.exists(os.path.join(self.project_dir, mod + ".py")) or \
+               os.path.isdir(os.path.join(self.project_dir, mod))
+
+    def _get_distribution_name(self, mod):
+        """Get installed pip package name for a module"""
+        try:
+            for dist in metadata.distributions():
+                try:
+                    top_level = dist.read_text("top_level.txt")
+                    if top_level and mod in top_level.splitlines():
+                        return dist.metadata["Name"]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # fallback to module name
         return mod
 
 
 # --- Factory function ---
-def scan(project_dir="."):
+def scan(project_dir=PROJECT_DIR):
     return FindPackage(project_dir)
 
 
 # --- Example usage ---
 if __name__ == "__main__":
-    fp = scan(".")
+    fp = scan(PROJECT_DIR)
     fp.print_summary()
